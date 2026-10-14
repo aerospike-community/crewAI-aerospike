@@ -138,6 +138,7 @@ exclude_dirs = ["lib/crewai/src/crewai/cli/templates", "lib/cli/src/crewai_cli/t
 [tool.pytest.ini_options]
 markers = [
     "telemetry: mark test as a telemetry test (don't mock telemetry)",
+    "aerospike: tests that need a live Aerospike server and skip when none is reachable",
 ]
 testpaths = [
     "lib/crewai/tests",

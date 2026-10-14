@@ -1,0 +1,94 @@
+---
+title: Início Rápido da Memória com Aerospike
+description: Execute a memória do CrewAI em um servidor Aerospike com um comando docker, uma instalação e algumas linhas de Python.
+icon: database
+mode: "wide"
+---
+
+## Visão Geral
+
+A memória do CrewAI pode guardar seus registros no Aerospike. Você registra uma factory de armazenamento uma vez na inicialização e depois seleciona o backend com uma especificação de armazenamento no formato `aerospike://host:port/namespace`. Qualquer outra especificação de armazenamento continua usando os backends embutidos. Esta página leva você do zero até uma memória armazenada e recuperada em poucos minutos. Para entender as razões do layout dos dados e o custo de uma busca, leia o [design da memória com Aerospike](/edge/pt-BR/learn/aerospike-memory-design).
+
+<Warning>
+Este início rápido executa um servidor sem autenticação configurada, e a especificação de armazenamento não aceita credenciais. Use-o apenas para desenvolvimento local, publique as portas somente no endereço de loopback e mantenha qualquer servidor compartilhado em uma rede privada.
+</Warning>
+
+## Pré-requisitos
+
+- Python 3.11 ou mais recente.
+- Docker.
+- Um provedor de embeddings configurado como você faria para qualquer uso de `Memory`. O embedder padrão precisa de `OPENAI_API_KEY`; para usar outro provedor, passe `embedder=` para `Memory`.
+- Um cliente que suporte valores vetoriais. Os embeddings são armazenados como valores vetoriais nativos, portanto o cliente Aerospike precisa suportá-los. Leia a seção Requisitos do cliente, em Limites, no [documento de design](/edge/pt-BR/learn/aerospike-memory-design) antes de depender disso em um projeto.
+
+## Inicie um servidor
+
+Execute a imagem do servidor Aerospike. As portas são publicadas somente no endereço de loopback, porque este servidor não tem autenticação.
+
+```bash
+docker run -d --name crewai-aerospike --ulimit nofile=15000:15000 -p 127.0.0.1:3000-3002:3000-3002 aerospike/aerospike-server
+```
+
+O servidor leva alguns segundos para iniciar. A configuração padrão da imagem inclui um namespace chamado `test`, que o exemplo abaixo usa. Para usar outro namespace, altere a última parte da especificação.
+
+## Instalação
+
+```bash
+pip install "crewai[aerospike]"
+```
+
+O extra `aerospike` instala o cliente `aerospike-sdk` e o `numpy`, e exige Python 3.11 ou mais recente.
+
+## Como usar
+
+Registre a factory antes de criar o `Memory`. Ela afeta apenas as instâncias de `Memory` criadas depois.
+
+```python
+from crewai import Memory
+from crewai.memory.storage.aerospike_storage import aerospike_storage_factory
+from crewai.memory.storage.factory import set_memory_storage_factory
+
+# Register once at startup. Specs that do not start with aerospike:// are left
+# to the built-in backends.
+set_memory_storage_factory(aerospike_storage_factory)
+
+memory = Memory(storage="aerospike://127.0.0.1:3000/test")
+
+memory.remember(
+    "The Q3 launch is planned for the first week of October.",
+    scope="/demo/planning",
+    categories=["launch", "schedule"],
+    importance=0.8,
+)
+
+matches = memory.recall("When is the launch?", scope="/demo", depth="shallow")
+for match in matches:
+    print(f"{match.score:.2f}  {match.record.scope}  {match.record.content}")
+```
+
+Ao passar escopo, categorias e importância explicitamente e usar `depth="shallow"`, nenhuma das duas chamadas precisa de um LLM, e apenas o embedder é usado. Se você omiti-los, o `Memory` os infere com seu modelo de análise, como faz com qualquer backend.
+
+## Verificação
+
+Ao executar o script, é impressa uma linha por memória recuperada, com a pontuação, o escopo e o conteúdo, por exemplo:
+
+```text
+0.74  /demo/planning  The Q3 launch is planned for the first week of October.
+```
+
+A pontuação é a pontuação de relevância combinada que o `recall` informa, portanto seu valor exato depende do seu embedder. Se a linha aparecer, o registro foi gravado no servidor e lido de volta pela busca vetorial.
+
+Quando terminar, pare e remova o servidor com `docker rm -f crewai-aerospike`.
+
+## Solução de problemas
+
+**A conexão é recusada.** O erro é gerado quando o `Memory` é construído, pois é nesse momento que o backend se conecta. Verifique com `docker ps` se o contêiner está em execução, se as portas estão publicadas como no comando acima e se o host e a porta da especificação correspondem. Aguarde alguns segundos após iniciar o contêiner e tente novamente.
+
+**Um `EmbeddingDimensionMismatchError` é gerado.** O armazenamento lembra o tamanho do primeiro embedding que viu, e um embedder que retorna um tamanho diferente é rejeitado. Use o embedder que criou o armazenamento ou redefina o armazenamento. Veja a seção Dimensão do embedding no [documento de design](/edge/pt-BR/learn/aerospike-memory-design).
+
+**Um `ImportError` pede para instalar o cliente.** O extra não está presente no ambiente que executa seu código. Instale-o com `pip install "crewai[aerospike]"`.
+
+**Um `ValueError` cita a especificação de armazenamento.** A especificação deve ser `aerospike://host:port/namespace`, opcionalmente seguida de `?set_prefix=NAME`. Credenciais na especificação e qualquer outra chave de consulta são rejeitadas.
+
+## Próximos passos
+
+Leia o [design da memória com Aerospike](/edge/pt-BR/learn/aerospike-memory-design) para conhecer o modelo de dados, os índices, o custo de uma busca, os limites e os requisitos do cliente. Para entender como a memória funciona em geral, veja [Memória](/pt-BR/concepts/memory).

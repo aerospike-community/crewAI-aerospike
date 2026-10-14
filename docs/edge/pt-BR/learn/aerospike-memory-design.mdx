@@ -1,0 +1,179 @@
+---
+title: Design da Memória com Aerospike
+description: Como a memória do CrewAI é mapeada no Aerospike, quanto custa uma busca, e quais são os limites e os requisitos de cliente do backend.
+icon: database
+mode: "wide"
+---
+
+## Visão Geral
+
+O backend Aerospike é uma implementação do protocolo `StorageBackend` que a `Memory` unificada do CrewAI usa para persistência. Ele fica em `crewai.memory.storage.aerospike_storage` e vem por trás de um extra opcional, `pip install "crewai[aerospike]"`, que instala o cliente `aerospike-sdk`. O cliente é importado sob demanda, então nada muda para projetos que não o usam.
+
+Cada escopo lógico é armazenado como um registro Aerospike cujos bins guardam as memórias desse escopo, e o embedding de cada memória é armazenado como um valor vetorial nativo dentro desse registro. A busca é uma varredura com ranqueamento por força bruta (brute-force), e não uma consulta aproximada de vizinhos mais próximos. As seções abaixo explicam cada decisão e o que ela custa. Para experimentar o backend primeiro, siga o [início rápido](/edge/pt-BR/learn/aerospike-memory-quickstart).
+
+## Como se integra
+
+Você seleciona o backend com uma especificação de armazenamento e registra uma factory uma vez na inicialização:
+
+```python
+from crewai import Memory
+from crewai.memory.storage.aerospike_storage import aerospike_storage_factory
+from crewai.memory.storage.factory import set_memory_storage_factory
+
+set_memory_storage_factory(aerospike_storage_factory)
+memory = Memory(storage="aerospike://127.0.0.1:3000/test")
+```
+
+A especificação tem o formato `aerospike://host:port/namespace`, com um parâmetro de consulta opcional, `set_prefix`, que dá nome aos sets que o backend usa (padrão `crewai_memory`). `aerospike_storage_factory` retorna um armazenamento para especificações que começam com `aerospike://` e `None` para todas as outras, de modo que a seleção embutida de LanceDB e Qdrant Edge continua funcionando para elas. Uma especificação que começa com `aerospike://` mas está malformada gera `ValueError`; ela nunca segue para outro backend.
+
+A gramática da especificação é uma lista de permissões estrita:
+
+| Parte | Regra |
+|---|---|
+| Tamanho e caracteres | No máximo 512 caracteres, sem espaços em branco nem caracteres de controle, sem `%`, sem fragmento, sem `@` (credenciais não são suportadas) |
+| Host | Um nome DNS, um endereço IPv4 ou um endereço IPv6 entre colchetes |
+| Porta | Obrigatória, de 1 a 65535 |
+| Namespace | Exatamente um segmento de caminho de 1 a 31 letras, dígitos, sublinhados ou hifens |
+| `set_prefix` | Opcional, uma vez, de 1 a 40 letras, dígitos ou sublinhados |
+| Qualquer outra coisa | Rejeitada com `ValueError`. As mensagens de erro nunca repetem um valor da especificação |
+
+Todas as configurações vêm da especificação. A biblioteca não lê variáveis de ambiente. Uma conexão de cliente é criada por host e porta em um processo e compartilhada por todo armazenamento que a usa, então fechar um armazenamento, o que `Memory.close()` faz, deixa a conexão aberta, e a conexão é fechada quando o interpretador termina.
+
+## Modelo de dados
+
+Um armazenamento usa dois sets, nomeados a partir do prefixo de set `P`: `P` guarda os registros de escopo e `P_meta` guarda um registro com fatos de nível de armazenamento.
+
+### Registros de escopo
+
+Cada registro de escopo tem a chave de texto `<scope>|<chunk>`, por exemplo `/team/sales|0`. O escopo é normalizado com uma barra no início e sem barra no final, e o escopo raiz é `/`. O número do chunk começa em 0 (veja Divisão em chunks abaixo).
+
+| Bin | Tipo | Conteúdo |
+|---|---|---|
+| `scope` | string | O caminho do escopo normalizado |
+| `chunk` | inteiro | O número do chunk |
+| `anc` | lista de strings | O escopo e cada ancestral, por exemplo `["/", "/team", "/team/sales"]` |
+| `cats` | lista de strings | As categorias distintas já adicionadas a este registro |
+| `created_at` | lista de inteiros | O momento de criação de cada memória no registro, em microssegundos desde a época, UTC |
+| `mem` | mapa de string para mapa | O id da memória para a entrada da memória |
+| `emb` | mapa de string para vetor | O id da memória para o embedding da memória, como valor vetorial float32 nativo |
+| `bytes` | inteiro | Uma estimativa acumulada do tamanho da carga, usada na divisão em chunks |
+
+Cada entrada em `mem` é um mapa com estas chaves:
+
+| Chave | Tipo | Conteúdo |
+|---|---|---|
+| `c` | string | O conteúdo da memória |
+| `cat` | lista de strings | As categorias da memória |
+| `md` | string | Os metadados, como texto JSON |
+| `imp` | float | A importância |
+| `ts` | inteiro | O momento de criação em microssegundos desde a época, UTC |
+| `la` | inteiro | O momento do último acesso em microssegundos desde a época, UTC |
+| `src` | string | A origem, omitida quando não há |
+| `prv` | booleano | Se a memória é privada |
+
+### O registro meta
+
+O set `P_meta` guarda um registro com a chave `store`. Seu bin `dim` guarda a dimensão do embedding do armazenamento, definida quando o primeiro embedding é salvo, e seu bin `fmt` guarda a versão do formato de armazenamento, atualmente 1.
+
+### Por que essas escolhas
+
+Um registro por escopo, com bins de mapa e lista, combina com a forma como a memória é usada. Listar, contar, descrever e excluir operam sobre um escopo ou uma subárvore de escopos, então as memórias de um escopo são lidas juntas, e uma escrita que toca um escopo é uma única chamada atômica em um único registro. Um registro por memória exigiria uma entrada de índice e uma chave por memória e transformaria cada uma dessas operações em muitas leituras pequenas. O preço é que um registro pode crescer, e é por isso que os registros são divididos em chunks.
+
+Os embeddings ficam em seu próprio bin para que cada tipo de leitura toque apenas o que precisa. Listagens, informações de escopo e contagens de categorias leem apenas `mem`. O ranqueamento da busca lê apenas `emb` e depois busca as entradas dos resultados pela chave. Os embeddings são valores vetoriais nativos em um mapa indexado pelo id da memória, e não bytes empacotados, de modo que os dados armazenados são tipados como vetores e o código não precisa de uma convenção de ordem de bytes ou de empacotamento.
+
+Os metadados são armazenados como texto JSON porque são um dicionário arbitrário. O texto preserva qualquer estrutura com exatidão. Os filtros de metadados são aplicados pelo cliente sobre os valores decodificados, e não há índice sobre metadados.
+
+Os timestamps são inteiros em microssegundos desde a época, UTC. Datetimes ingênuos (naive) que você passa são tratados como UTC, datetimes com fuso são convertidos para UTC, e as leituras retornam datetimes ingênuos em UTC.
+
+Os prefixos de escopo reconhecem segmentos de caminho: o prefixo `/a` corresponde a `/a` e `/a/b`, e não corresponde a `/ab`.
+
+## Divisão em chunks
+
+Um escopo normalmente vive em um registro, `<scope>|0`. Os registros são escritos e lidos inteiros, e o servidor limita seu tamanho (comumente 1 MiB, definido por namespace), então um escopo que continua crescendo é dividido em vários registros. O backend mantém uma estimativa da carga no bin `bytes`. Ela conta o conteúdo, o texto dos metadados, as categorias e a origem de cada memória, uma sobrecarga fixa por entrada e quatro bytes por dimensão do embedding mais uma pequena sobrecarga para o embedding.
+
+O limite de chunk é, por padrão, 262.144 bytes e pode ser definido até 524.288 bytes pelo argumento `chunk_limit_bytes` de `AerospikeStorage`. Quando um salvamento levaria um registro além do limite, o backend coloca as memórias que não cabem no registro de chunk seguinte, `<scope>|1` e assim por diante, de modo que nenhum chunk seja preenchido além do limite. Uma única memória maior que o limite recebe um chunk só para ela. Se o servidor ainda responder que um registro é grande demais porque a estimativa ficou baixa, a escrita passa para o chunk seguinte uma vez. As entradas permanecem no chunk onde foram escritas, exceto que um update que muda o escopo de uma memória a move.
+
+## Índices
+
+O backend cria quatro índices secundários na primeira vez que se conecta a um prefixo de set em um processo. Criar um índice que já existe não é um erro, então reconectar, ou outro processo iniciar primeiro, é inofensivo.
+
+| Índice | Bin | Atende |
+|---|---|---|
+| `P_scope_idx` | `anc`, uma lista de strings | Restringir busca, listagem, contagem e exclusão a uma subárvore de escopo |
+| `P_cats_idx` | `cats`, uma lista de strings | Restringir por categoria |
+| `P_created_idx` | `created_at`, uma lista de inteiros | Excluir memórias mais antigas que um momento |
+| `P_memids_idx` | `mem`, chaves de mapa do tipo string | Encontrar uma memória pelo id |
+
+O índice de ids de memória existe porque buscar, atualizar, tocar e excluir pelo id não trazem escopo, e sem ele o backend teria de varrer tudo. Os índices apenas restringem os registros candidatos. O backend sempre reverifica os filtros exatos nas entradas, então bins que superaproximam, como `cats` e `anc`, que só crescem, custam algumas leituras extras e nunca geram resultados errados.
+
+## Busca e modelo de custo
+
+A busca é uma varredura com ranqueamento por força bruta (brute-force). Não há índice aproximado de vizinhos mais próximos. Uma consulta restringe os registros de escopo candidatos no servidor, usando o índice de escopo para um prefixo de escopo e o índice de categorias quando categorias são informadas. Em seguida, lê os embeddings de todas as memórias candidatas e calcula a similaridade de cosseno no cliente com numpy. Os bytes transferidos e o processamento crescem linearmente com o número de memórias candidatas vezes a dimensão do embedding.
+
+Um exemplo prático: 10.000 memórias candidatas com 1.536 dimensões correspondem a 10.000 vezes 1.536 vezes 4 bytes, cerca de 61 MB de embeddings lidos por uma consulta sem escopo. Com 3.072 dimensões, a mesma consulta lê cerca de 123 MB.
+
+O principal controle é o escopo da consulta. Uma consulta com prefixo de escopo lê apenas os registros sob esse prefixo, então passe um escopo para `recall` sempre que souber onde está a resposta. As categorias restringem ainda mais os candidatos.
+
+O ranqueamento roda no cliente porque o vetor de cada memória está aninhado dentro do mapa do registro de seu escopo, um registro guarda muitas memórias, e o ranqueamento vetorial no servidor não é usado. Depois da pontuação, o backend busca pela chave as entradas apenas dos melhores resultados e aplica a elas os filtros exatos de categoria e metadados.
+
+Os resultados da busca têm estas propriedades:
+
+- A pontuação é a similaridade de cosseno, de -1 a 1, e um vetor de comprimento zero recebe 0,0.
+- `min_score` é inclusivo, e os resultados são ordenados por pontuação e depois por id.
+- Memórias salvas sem embedding podem ser listadas e buscadas, mas nunca são ranqueadas.
+- Uma busca lê no máximo 50.000 memórias e 100.000 registros de escopo. Além disso, ela registra um aviso e ranqueia o que leu, então uma consulta muito ampla em um armazenamento muito grande pode retornar resultados incompletos. Restringir o escopo da consulta evita isso.
+
+## Dimensão do embedding
+
+O armazenamento registra a dimensão do primeiro embedding que salva, no registro meta, com semântica somente de criação (create-only) para que dois processos que iniciam juntos concordem. Depois disso, salvar um embedding de tamanho diferente, ou buscar com uma consulta de tamanho diferente, gera `EmbeddingDimensionMismatchError` (de `crewai.memory.storage.backend`).
+
+Isso geralmente significa que o embedder mudou, por exemplo de um modelo de 1.536 dimensões para um de 3.072 dimensões. Para se recuperar, configure o embedder que criou o armazenamento, ou limpe o armazenamento com `memory.reset_all()` e salve novamente. Um reset completo trunca apenas os dois sets deste prefixo de set e limpa a dimensão armazenada, de modo que o próximo embedding define uma nova. Ele nunca toca em outros sets.
+
+## Consistência e concorrência
+
+Cada escrita em um registro de escopo é uma única chamada atômica que combina os upserts de mapa, os appends de lista e a atualização de tamanho, então salvamentos concorrentes no mesmo escopo não se sobrescrevem. Um salvamento que abrange vários escopos escreve vários registros, e essas escritas não são atômicas como grupo. Um update que move uma memória para outro escopo escreve o novo registro antes de remover o antigo, então um leitor pode ver brevemente a memória nos dois.
+
+As remoções leem o registro e escrevem de volta com verificação de geração (generation), e tentam novamente sobre o registro atualizado se outra escrita entrou primeiro. Após cinco tentativas, geram um `RuntimeError`. Um registro que fica sem nenhuma memória é excluído.
+
+Um cliente é compartilhado por processo. Os métodos assíncronos `asave`, `asearch` e `adelete` executam a implementação síncrona em threads de trabalho, então não bloqueiam o loop de eventos, e usam o mesmo cliente compartilhado.
+
+## Como difere dos backends integrados
+
+O backend Aerospike segue o mesmo protocolo `StorageBackend` dos backends integrados LanceDB e Qdrant Edge, mas alguns comportamentos são diferentes. Verifique-os antes de migrar um projeto existente.
+
+| Comportamento | Aerospike | Qdrant Edge | LanceDB |
+|---|---|---|---|
+| Prefixo de escopo `/a` | Corresponde por segmento de caminho: `/a` e `/a/b`, não `/ab` | Corresponde por segmento de caminho, como o Aerospike | Corresponde como prefixo de texto simples: `/ab` também corresponde |
+| Pontuação | Similaridade de cosseno, de -1 a 1 | Similaridade de cosseno, de -1 a 1 | `1/(1+distance)`, sempre acima de 0 |
+| `min_score` padrão de 0.0 | Exclui resultados com similaridade negativa | Exclui resultados com similaridade negativa | Não exclui nada, porque nenhuma pontuação é negativa |
+| `delete(record_ids=[])` | Comporta-se como se nenhum filtro de IDs tivesse sido informado | Comporta-se como se nenhum filtro de IDs tivesse sido informado | Comporta-se como se nenhum filtro de IDs tivesse sido informado |
+
+Como as pontuações vêm de fórmulas diferentes, o mesmo limite `min_score` não seleciona os mesmos resultados em todos os backends, então ajuste-o novamente após a migração. Nos três backends, uma lista `record_ids` vazia é tratada como se nenhum filtro de IDs tivesse sido informado. Sem outros filtros, `delete(record_ids=[])` exclui todas as memórias; com outros filtros, eles determinam o que será excluído. Monte a lista de IDs primeiro e confirme que ela não está vazia se a intenção for excluir somente aqueles IDs.
+
+A autenticação está fora do escopo desta versão, como descrito em Limites abaixo.
+
+## Limites
+
+| Limite | Valor |
+|---|---|
+| Resultados por chamada (`limit`) | Um inteiro positivo, limitado a 1.000 |
+| Memórias lidas por uma busca ou listagem | 50.000, depois aviso e truncamento |
+| Registros de escopo lidos por uma busca ou listagem | 100.000, depois aviso e truncamento |
+| Ids de registro por chamada | No máximo 10.000, caso contrário `ValueError` |
+| Categorias restringidas no servidor | Até 32. Acima disso o filtro ainda se aplica, no cliente |
+| Escopo | No máximo 512 caracteres e 32 segmentos |
+| Categoria ou id de memória | No máximo 1.024 bytes |
+| Uma memória | No máximo 524.288 bytes de carga estimada |
+| Limite de chunk | Padrão 262.144 bytes, no máximo 524.288 |
+
+Exceder um limite de tamanho ao salvar gera `ValueError` antes de qualquer escrita. Uma lista `record_ids` vazia não exclui nada.
+
+Não há expiração: o backend não define tempo de vida (TTL), então as memórias permanecem até você excluí-las.
+
+Não há autenticação nesta versão. A especificação de armazenamento não aceita credenciais, e o backend se conecta sem nenhuma. Execute o servidor Aerospike em uma rede privada, ou vincule-o ao endereço de loopback durante o desenvolvimento, e não o exponha a redes não confiáveis. Qualquer pessoa que alcance o namespace pode ler e alterar seus registros.
+
+Um prefixo de set é uma fronteira de confiança. Os escopos e o sinalizador `private` organizam e filtram memórias na recuperação; eles não são controle de acesso. Tudo o que é armazenado sob um prefixo de set fica visível para todo cliente que consiga alcançá-lo, então use namespaces ou servidores separados para dados que precisam ficar isolados.
+
+### Requisitos do cliente
+
+Os embeddings são armazenados como valores vetoriais nativos, portanto o backend precisa de um cliente `aerospike-sdk` que suporte o tipo de valor vetorial, inclusive dentro de um mapa. O suporte a isso no `aerospike-sdk` atualmente publicado não foi verificado. Confirme que o seu cliente expõe o tipo vetorial antes de depender deste backend e trate o backend como dependente desse suporte.

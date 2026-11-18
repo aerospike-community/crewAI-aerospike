@@ -12,8 +12,11 @@ import pytest
 import crewai.memory.storage.aerospike_storage as aerospike_module
 from crewai.memory.storage.aerospike_storage import (
     AerospikeStorage,
+    _estimate_bytes,
     _get_connection,
+    _record_to_entry,
     _sdk,
+    _to_micros,
     aerospike_storage_factory,
 )
 from crewai.memory.storage.backend import EmbeddingDimensionMismatchError
@@ -55,6 +58,30 @@ def test_save_creates_one_record_per_scope(
         for value in bins["emb"].values():
             assert isinstance(value, sdk.Vector)
             assert len(value.numpy_value) == 4
+
+
+def test_save_shared_timestamps_preserves_byte_estimate(
+    storage: AerospikeStorage, make: Make, dump: Dump
+) -> None:
+    created_at = datetime(2024, 1, 1)
+    records = [
+        make("first", "/a", [1, 0, 0, 0], created_at=created_at),
+        make("a longer second memory", "/a", None, created_at=created_at),
+    ]
+    storage.save(records[:1])
+    storage.save(records[1:])
+
+    bins = dump()["/a|0"]
+
+    assert set(bins["mem"]) == {record.id for record in records}
+    assert bins["created_at"] == [_to_micros(created_at)] * 2
+    assert bins["bytes"] == sum(
+        _estimate_bytes(record.id, _record_to_entry(record), len(record.embedding or ()))
+        for record in records
+    )
+    assert storage.count() == 2
+    assert storage.delete(older_than=datetime(2024, 1, 2)) == 2
+    assert storage.count() == 0
 
 
 def _index_names(

@@ -758,7 +758,7 @@ class AerospikeStorage:
         return out
 
     def _read_sizes(self, keys: list[Any]) -> list[int]:
-        """Number of memories per record, counted on the server."""
+        """Number of memories per record, in key order; zero for missing keys."""
         out: list[int] = []
         for start in range(0, len(keys), _BATCH_KEYS):
             window = keys[start : start + _BATCH_KEYS]
@@ -770,9 +770,18 @@ class AerospikeStorage:
                 .execute() as stream
             ):
                 rows = list(stream)
+            if len(rows) != len(window):
+                raise RuntimeError(
+                    "Aerospike batch size read returned an unexpected row count."
+                )
             for row in rows:
-                ok = row.is_ok and row.record is not None
-                out.append(int(row.record.bins.get("mem") or 0) if ok else 0)
+                if row.is_ok and row.record is not None:
+                    out.append(int(row.record.bins.get("mem") or 0))
+                elif row.result_code == self._api.ResultCode.KEY_NOT_FOUND_ERROR:
+                    out.append(0)
+                else:
+                    row.or_raise()
+                    out.append(0)
         return out
 
     def _fetch_entries(
@@ -1370,9 +1379,20 @@ class AerospikeStorage:
         """Delete whole records, in batches, ignoring records already gone."""
         for start in range(0, len(keys), _BATCH_KEYS):
             window = keys[start : start + _BATCH_KEYS]
-            self._session.delete(*window).execute(
+            with self._session.delete(*window).execute(
                 on_error=self._api.ErrorStrategy.IN_STREAM
-            ).close()
+            ) as stream:
+                rows = list(stream)
+            if len(rows) != len(window):
+                raise RuntimeError(
+                    "Aerospike batch delete returned an unexpected row count."
+                )
+            for row in rows:
+                if (
+                    not row.is_ok
+                    and row.result_code != self._api.ResultCode.KEY_NOT_FOUND_ERROR
+                ):
+                    row.or_raise()
 
     @_off_event_loop
     def delete(

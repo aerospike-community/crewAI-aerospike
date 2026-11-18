@@ -16,6 +16,7 @@ import sys
 import time
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -60,6 +61,85 @@ def never_connect(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _unconnected() -> AerospikeStorage:
     return object.__new__(AerospikeStorage)
+
+
+def _batch_storage(rows: list[Any]) -> AerospikeStorage:
+    sdk = pytest.importorskip("aerospike_sdk")
+    storage = _unconnected()
+    storage._api = sdk
+    session = MagicMock()
+    storage._connection = SimpleNamespace(session=session)
+    builder = session.query.return_value
+    builder.bin.return_value = builder
+    builder.map_size.return_value = builder
+    builder.include_missing_keys.return_value = builder
+    session.delete.return_value = builder
+    builder.execute.return_value = sdk.SyncRecordStream(iter(rows))
+    return storage
+
+
+@pytest.mark.parametrize("method", ["_read_sizes", "_delete_keys"])
+@pytest.mark.parametrize("row_count", [0, 1, 3])
+def test_batch_rejects_unexpected_row_counts(method: str, row_count: int) -> None:
+    sdk = pytest.importorskip("aerospike_sdk")
+    key = sdk.DataSet.of("test", "memory").id("a")
+    row = sdk.RecordResult(
+        key=key, record=SimpleNamespace(bins={"mem": 1}), result_code=sdk.ResultCode.OK
+    )
+    storage = _batch_storage([row] * row_count)
+
+    with pytest.raises(RuntimeError, match="unexpected row count"):
+        getattr(storage, method)([key, key])
+
+
+@pytest.mark.parametrize("method", ["_read_sizes", "_delete_keys"])
+@pytest.mark.parametrize("client_error", [False, True])
+def test_batch_propagates_per_key_errors(method: str, client_error: bool) -> None:
+    sdk = pytest.importorskip("aerospike_sdk")
+    keys = sdk.DataSet.of("test", "memory").ids("a", "b")
+    rows = [
+        sdk.RecordResult(
+            key=keys[0],
+            record=SimpleNamespace(bins={"mem": 3}),
+            result_code=sdk.ResultCode.OK,
+        ),
+        sdk.RecordResult(
+            key=keys[1],
+            record=None,
+            result_code=sdk.ResultCode.OK if client_error else sdk.ResultCode.TIMEOUT,
+            exception=sdk.TimeoutError("client timeout") if client_error else None,
+        ),
+    ]
+    storage = _batch_storage(rows)
+
+    with pytest.raises(sdk.TimeoutError):
+        getattr(storage, method)(keys)
+
+
+@pytest.mark.parametrize("method", ["_read_sizes", "_delete_keys"])
+def test_batch_allows_missing_keys_and_empty_maps(method: str) -> None:
+    sdk = pytest.importorskip("aerospike_sdk")
+    keys = sdk.DataSet.of("test", "memory").ids("a", "b", "c")
+    rows = [
+        sdk.RecordResult(
+            key=keys[0],
+            record=SimpleNamespace(bins={"mem": 3}),
+            result_code=sdk.ResultCode.OK,
+        ),
+        sdk.RecordResult(
+            key=keys[1], record=None, result_code=sdk.ResultCode.KEY_NOT_FOUND_ERROR
+        ),
+        sdk.RecordResult(
+            key=keys[2],
+            record=SimpleNamespace(bins={"mem": 0}),
+            result_code=sdk.ResultCode.OK,
+        ),
+    ]
+    storage = _batch_storage(rows)
+
+    result = getattr(storage, method)(keys)
+
+    assert result == ([3, 0, 0] if method == "_read_sizes" else None)
 
 
 def test_unit_suite_never_connects() -> None:

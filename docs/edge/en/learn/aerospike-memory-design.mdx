@@ -1,0 +1,179 @@
+---
+title: Aerospike Memory Design
+description: How CrewAI memory maps onto Aerospike, what a search costs, and the limits and client requirements of the backend.
+icon: database
+mode: "wide"
+---
+
+## Overview
+
+The Aerospike backend is an implementation of the `StorageBackend` protocol that CrewAI's unified `Memory` uses for persistence. It lives in `crewai.memory.storage.aerospike_storage` and ships behind an optional extra, `pip install "crewai[aerospike]"`, which installs the `aerospike-sdk` client. The client is imported lazily, so nothing changes for projects that do not use it.
+
+Every logical scope is stored as one Aerospike record whose bins hold that scope's memories, and each memory's embedding is stored as a native vector value inside that record. Search is a brute-force scan and rank, not an approximate-nearest-neighbor lookup. The sections below explain each decision and what it costs. To try the backend first, follow the [quickstart](/edge/en/learn/aerospike-memory-quickstart).
+
+## How it plugs in
+
+You select the backend with a storage spec and register a factory once at startup:
+
+```python
+from crewai import Memory
+from crewai.memory.storage.aerospike_storage import aerospike_storage_factory
+from crewai.memory.storage.factory import set_memory_storage_factory
+
+set_memory_storage_factory(aerospike_storage_factory)
+memory = Memory(storage="aerospike://127.0.0.1:3000/test")
+```
+
+The spec has the form `aerospike://host:port/namespace`, with one optional query parameter, `set_prefix`, that names the sets the backend uses (default `crewai_memory`). `aerospike_storage_factory` returns a storage for specs that start with `aerospike://` and `None` for every other spec, so the built-in LanceDB and Qdrant Edge selection keeps working for them. A spec that starts with `aerospike://` but is malformed raises `ValueError`; it never falls through to another backend.
+
+The spec grammar is a strict allowlist:
+
+| Part | Rule |
+|---|---|
+| Length and characters | At most 512 characters, no whitespace or control characters, no `%`, no fragment, no `@` (credentials are not supported) |
+| Host | A DNS name, an IPv4 address or a bracketed IPv6 address |
+| Port | Required, 1 to 65535 |
+| Namespace | Exactly one path segment of 1 to 31 letters, digits, underscores or hyphens |
+| `set_prefix` | Optional, once, 1 to 40 letters, digits or underscores |
+| Anything else | Rejected with `ValueError`. Error messages never repeat a value from the spec |
+
+All settings come from the spec. The library reads no environment variables. One client connection is created per host and port in a process and shared by every storage that uses it, so closing a storage, which `Memory.close()` does, leaves the connection open, and the connection is closed when the interpreter exits.
+
+## Data model
+
+A store uses two sets, named after the set prefix `P`: `P` holds the scope records, and `P_meta` holds one record with store-level facts.
+
+### Scope records
+
+Each scope record has the string key `<scope>|<chunk>`, for example `/team/sales|0`. The scope is normalized with a leading slash and no trailing slash, and the root scope is `/`. The chunk number starts at 0 (see Chunking below).
+
+| Bin | Type | Content |
+|---|---|---|
+| `scope` | string | The normalized scope path |
+| `chunk` | integer | The chunk number |
+| `anc` | list of strings | The scope and each ancestor, for example `["/", "/team", "/team/sales"]` |
+| `cats` | list of strings | The distinct categories ever added to this record |
+| `created_at` | list of integers | The creation time of each memory in the record, in microseconds since the epoch, UTC |
+| `mem` | map of string to map | Memory id to the memory's entry |
+| `emb` | map of string to vector | Memory id to the memory's embedding, as a native float32 vector value |
+| `bytes` | integer | A running estimate of the payload size, used for chunking |
+
+Each entry in `mem` is a map with these keys:
+
+| Key | Type | Content |
+|---|---|---|
+| `c` | string | The memory content |
+| `cat` | list of strings | The memory's categories |
+| `md` | string | The metadata, as JSON text |
+| `imp` | float | The importance |
+| `ts` | integer | The creation time in microseconds since the epoch, UTC |
+| `la` | integer | The last-accessed time in microseconds since the epoch, UTC |
+| `src` | string | The source, omitted when there is none |
+| `prv` | boolean | Whether the memory is private |
+
+### The meta record
+
+The `P_meta` set holds one record with the key `store`. Its `dim` bin holds the embedding dimension of the store, set when the first embedding is saved, and its `fmt` bin holds the storage format version, currently 1.
+
+### Why these choices
+
+One record per scope, with map and list bins, fits how memory is used. Listing, counting, describing and deleting work on a scope or a subtree of scopes, so a scope's memories are read together, and a write that touches a scope is one atomic call on one record. One record per memory would need an index entry and a key per memory and would turn each of those operations into many small reads. The price is that a record can grow, which is why records are chunked.
+
+Embeddings sit in their own bin so that each kind of read touches only what it needs. Listings, scope information and category counts read only `mem`. Search ranking reads only `emb`, then fetches the entries of the hits by key. The embeddings are native vector values in a map keyed by memory id, not packed bytes, so the stored data is typed as vectors and the code needs no byte-order or packing convention.
+
+Metadata is stored as JSON text because it is an arbitrary dictionary. Text round-trips any structure exactly. Metadata filters are applied by the client to the decoded values, and there is no index on metadata.
+
+Timestamps are integers in microseconds since the epoch, UTC. Naive datetimes you pass in are treated as UTC, aware datetimes are converted to UTC, and reads return naive UTC datetimes.
+
+Scope prefixes are path-segment aware: the prefix `/a` matches `/a` and `/a/b`, and does not match `/ab`.
+
+## Chunking
+
+A scope normally lives in one record, `<scope>|0`. Records are written and read whole, and the server limits their size (commonly 1 MiB, set per namespace), so a scope that keeps growing is split across records. The backend keeps a payload estimate in the `bytes` bin. It counts the content, the metadata text, the categories and the source of each memory, a fixed overhead per entry, and four bytes per embedding dimension plus a small overhead for the embedding.
+
+The chunk limit defaults to 262,144 bytes and can be set up to 524,288 bytes through the `chunk_limit_bytes` argument of `AerospikeStorage`. When a save would push a record past the limit, the backend places the memories that do not fit into the next chunk record, `<scope>|1` and so on, so no chunk is filled past the limit. A single memory that is larger than the limit gets a chunk of its own. If the server still replies that a record is too big because the estimate ran low, the write moves to the next chunk once. Entries stay in the chunk where they were written, except that an update that changes a memory's scope moves it.
+
+## Indexes
+
+The backend creates four secondary indexes the first time it connects to a set prefix in a process. Creating an index that already exists is not an error, so reconnecting, or another process starting first, is harmless.
+
+| Index | Bin | Serves |
+|---|---|---|
+| `P_scope_idx` | `anc`, a list of strings | Narrowing search, listing, counting and deletion to a scope subtree |
+| `P_cats_idx` | `cats`, a list of strings | Narrowing by category |
+| `P_created_idx` | `created_at`, a list of integers | Deleting memories older than a time |
+| `P_memids_idx` | `mem`, map keys of strings | Finding a memory by id |
+
+The memory-id index exists because fetching, updating, touching and deleting by id carry no scope, so without it the backend would have to scan. The indexes only narrow the candidate records. The backend always re-checks the exact filters on the entries, so bins that over-approximate, such as `cats` and `anc`, which only grow, cost some extra reads and never wrong results.
+
+## Search and cost model
+
+Search is a brute-force scan and rank. There is no approximate-nearest-neighbor index. A query narrows the candidate scope records on the server, using the scope index for a scope prefix and the category index when categories are given. It then reads the embeddings of every candidate memory and computes cosine similarity on the client with numpy. Bytes moved and compute grow linearly with the number of candidate memories times the embedding dimension.
+
+A worked example: 10,000 candidate memories at 1,536 dimensions is 10,000 times 1,536 times 4 bytes, about 61 MB of embeddings, read for one unscoped query. At 3,072 dimensions the same query reads about 123 MB.
+
+The main control is the query's scope. A query with a scope prefix reads only the records under that prefix, so give `recall` a scope whenever you know where the answer lives. Categories narrow the candidates further.
+
+Ranking runs in the client because each memory's vector is nested inside its scope record's map, one record holds many memories, and server-side vector ranking is not used. After scoring, the backend fetches the entries of only the best results by key and applies the exact category and metadata filters to them.
+
+Search results have these properties:
+
+- The score is cosine similarity, from -1 to 1, and a vector with zero length scores 0.0.
+- `min_score` is inclusive, and results are ordered by score, then by id.
+- Memories saved without an embedding can be listed and fetched but are never ranked.
+- A search reads at most 50,000 memories and 100,000 scope records. Past that bound it logs a warning and ranks what it read, so a very broad query on a very large store can return incomplete results. Scoping the query avoids this.
+
+## Embedding dimension
+
+The store records the dimension of the first embedding it saves, in the meta record, with create-only semantics so that two processes starting together agree. After that, saving an embedding of a different length, or searching with a query of a different length, raises `EmbeddingDimensionMismatchError` (from `crewai.memory.storage.backend`).
+
+This usually means the embedder changed, for example from a 1,536-dimension model to a 3,072-dimension one. To recover, either configure the embedder that created the store, or clear the store with `memory.reset_all()` and save again. A full reset truncates only this set prefix's two sets and clears the stored dimension, so the next embedding sets a new one. It never touches other sets.
+
+## Consistency and concurrency
+
+Each write to one scope record is a single atomic call that combines the map upserts, the list appends and the size update, so concurrent saves to the same scope do not overwrite each other. A save that spans several scopes writes several records, and those writes are not atomic as a group. An update that moves a memory to another scope writes the new record before it removes the old one, so a reader can briefly see the memory in both.
+
+Removals read the record and write back with a generation check, and retry against the fresh record if another write got in first. After five attempts they raise a `RuntimeError`. A record that is left with no memories is deleted.
+
+One client is shared per process. The async methods `asave`, `asearch` and `adelete` run the synchronous implementation on worker threads, so they do not block the event loop, and they use the same shared client.
+
+## How it differs from the built-in backends
+
+The Aerospike backend follows the same `StorageBackend` protocol as the built-in LanceDB and Qdrant Edge backends, but a few behaviors differ. Check these before you switch an existing project.
+
+| Behavior | Aerospike | Qdrant Edge | LanceDB |
+|---|---|---|---|
+| Scope prefix `/a` | Matches by path segment: `/a` and `/a/b`, not `/ab` | Matches by path segment, like Aerospike | Matches as a plain string prefix: `/ab` matches too |
+| Score | Cosine similarity, from -1 to 1 | Cosine similarity, from -1 to 1 | `1/(1+distance)`, always above 0 |
+| Default `min_score` of 0.0 | Excludes results with negative similarity | Excludes results with negative similarity | Excludes nothing, because no score is negative |
+| `delete(record_ids=[])` | Behaves as if no ID filter was given | Behaves as if no ID filter was given | Behaves as if no ID filter was given |
+
+Because the scores come from different formulas, the same `min_score` threshold does not select the same results across backends, so tune it again after a switch. An empty `record_ids` list is treated as if no ID filter was given on all three backends. With no other filter, `delete(record_ids=[])` deletes all memories; with other filters, those filters determine what is deleted. Build the ID list first and check that it is not empty if you intend to delete only those IDs.
+
+Authentication is out of scope for this release, as described under Limits below.
+
+## Limits
+
+| Limit | Value |
+|---|---|
+| Results per call (`limit`) | A positive integer, clamped to 1,000 |
+| Memories read by one search or listing | 50,000, then a warning and truncation |
+| Scope records read by one search or listing | 100,000, then a warning and truncation |
+| Record ids per call | At most 10,000, otherwise `ValueError` |
+| Categories narrowed on the server | Up to 32. Beyond that the filter still applies, on the client |
+| Scope | At most 512 characters and 32 segments |
+| Category or memory id | At most 1,024 bytes |
+| One memory | At most 524,288 bytes of estimated payload |
+| Chunk limit | Default 262,144 bytes, at most 524,288 |
+
+Exceeding a size limit on a save raises `ValueError` before anything is written. An empty `record_ids` list deletes nothing.
+
+There is no expiry: the backend sets no time to live, so memories stay until you delete them.
+
+There is no authentication in this release. The storage spec accepts no credentials, and the backend connects without any. Run the Aerospike server on a private network, or bind it to the loopback address for development, and do not expose it to untrusted networks. Anyone who can reach the namespace can read and change its records.
+
+One set prefix is one trust boundary. Scopes and the `private` flag organize and filter memories for recall; they are not access control. Everything stored under a set prefix is visible to every client that can reach it, so use separate namespaces or servers for data that must be kept apart.
+
+### Client requirements
+
+Embeddings are stored as native vector values, so the backend needs an `aerospike-sdk` client that supports the vector value type, including inside a map. Support for that in the currently released `aerospike-sdk` has not been verified. Check that your client exposes the vector type before you depend on this backend, and treat the backend as dependent on that support.

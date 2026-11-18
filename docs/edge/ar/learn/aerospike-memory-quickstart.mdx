@@ -1,0 +1,94 @@
+---
+title: البدء السريع مع ذاكرة Aerospike
+description: شغّل ذاكرة CrewAI على خادم Aerospike بأمر docker واحد وتثبيت واحد وبضعة أسطر من Python.
+icon: database
+mode: "wide"
+---
+
+## نظرة عامة
+
+يمكن لذاكرة CrewAI أن تحتفظ بسجلاتها في Aerospike. تسجّل مصنع تخزين مرة واحدة عند بدء التشغيل، ثم تختار الواجهة الخلفية بمواصفة تخزين بالشكل `aerospike://host:port/namespace`. أي مواصفة تخزين أخرى تستمر في استخدام الواجهات الخلفية المدمجة. تنقلك هذه الصفحة من الصفر إلى ذاكرة محفوظة ومسترجعة خلال دقائق. لمعرفة أسباب تصميم البيانات وكلفة البحث، اقرأ [تصميم ذاكرة Aerospike](/edge/ar/learn/aerospike-memory-design).
+
+<Warning>
+يشغّل هذا الدليل خادمًا بلا أي مصادقة مضبوطة، ولا تقبل مواصفة التخزين أي بيانات اعتماد. استخدمه للتطوير المحلي فقط، وانشر منافذه على عنوان الحلقة المحلية (loopback) فقط، وأبقِ أي خادم مشترك على شبكة خاصة.
+</Warning>
+
+## المتطلبات
+
+- Python 3.11 أو أحدث.
+- Docker.
+- مزود تضمين (embedding) مضبوط بالطريقة نفسها التي تستخدمها مع أي استخدام لـ `Memory`. يحتاج المضمِّن الافتراضي إلى `OPENAI_API_KEY`؛ ولاستخدام مزود آخر، مرّر `embedder=` إلى `Memory`.
+- عميل يدعم قيم المتجهات. تُخزَّن التضمينات كقيم متجهات أصلية، لذا يجب أن يدعمها عميل Aerospike. اقرأ قسم «متطلبات العميل» ضمن «الحدود» في [وثيقة التصميم](/edge/ar/learn/aerospike-memory-design) قبل أن تعتمد على هذا في مشروع.
+
+## تشغيل خادم
+
+شغّل صورة خادم Aerospike. تُنشر المنافذ على عنوان الحلقة المحلية فقط، لأن هذا الخادم بلا مصادقة.
+
+```bash
+docker run -d --name crewai-aerospike --ulimit nofile=15000:15000 -p 127.0.0.1:3000-3002:3000-3002 aerospike/aerospike-server
+```
+
+يحتاج الخادم إلى بضع ثوانٍ ليبدأ. تتضمن الإعدادات الافتراضية للصورة مساحة أسماء باسم `test`، وهي التي يستخدمها المثال أدناه. لاستخدام مساحة أسماء أخرى، غيّر الجزء الأخير من المواصفة.
+
+## التثبيت
+
+```bash
+pip install "crewai[aerospike]"
+```
+
+تثبّت الإضافة `aerospike` العميل `aerospike-sdk` و`numpy`، وتحتاج إلى Python 3.11 أو أحدث.
+
+## الاستخدام
+
+سجّل المصنع قبل إنشاء `Memory`. يؤثر ذلك فقط في نسخ `Memory` التي تُنشأ بعده.
+
+```python
+from crewai import Memory
+from crewai.memory.storage.aerospike_storage import aerospike_storage_factory
+from crewai.memory.storage.factory import set_memory_storage_factory
+
+# Register once at startup. Specs that do not start with aerospike:// are left
+# to the built-in backends.
+set_memory_storage_factory(aerospike_storage_factory)
+
+memory = Memory(storage="aerospike://127.0.0.1:3000/test")
+
+memory.remember(
+    "The Q3 launch is planned for the first week of October.",
+    scope="/demo/planning",
+    categories=["launch", "schedule"],
+    importance=0.8,
+)
+
+matches = memory.recall("When is the launch?", scope="/demo", depth="shallow")
+for match in matches:
+    print(f"{match.score:.2f}  {match.record.scope}  {match.record.content}")
+```
+
+عند تمرير النطاق والفئات والأهمية صراحةً واستخدام `depth="shallow"`، لا يحتاج أي من الاستدعاءين إلى LLM، ولا يُستخدم سوى المضمِّن. إذا حذفتها فإن `Memory` تستنتجها بنموذج التحليل الخاص بها، كما تفعل مع أي واجهة خلفية.
+
+## التحقق
+
+يطبع تشغيل السكربت سطرًا واحدًا لكل ذاكرة مسترجعة، يتضمن الدرجة والنطاق والمحتوى، على سبيل المثال:
+
+```text
+0.74  /demo/planning  The Q3 launch is planned for the first week of October.
+```
+
+الدرجة هي درجة الصلة المركبة التي يبلغ عنها `recall`، لذا تعتمد قيمتها الدقيقة على المضمِّن لديك. إذا ظهر السطر فهذا يعني أن السجل كُتب على الخادم وقُرئ مجددًا عبر البحث بالمتجهات.
+
+عند الانتهاء، أوقف الخادم وأزله بالأمر `docker rm -f crewai-aerospike`.
+
+## استكشاف الأخطاء وإصلاحها
+
+**رُفض الاتصال.** يظهر الخطأ عند إنشاء `Memory`، لأن الواجهة الخلفية تتصل في تلك اللحظة. تحقق من أن الحاوية تعمل بالأمر `docker ps`، ومن أن المنافذ منشورة كما في الأمر أعلاه، ومن أن المضيف والمنفذ في المواصفة يطابقانها. انتظر بضع ثوانٍ بعد تشغيل الحاوية ثم أعد المحاولة.
+
+**ظهور `EmbeddingDimensionMismatchError`.** يتذكر المخزن طول أول تضمين رآه، ويُرفض أي مضمِّن يعيد طولًا مختلفًا. استخدم المضمِّن الذي أنشأ المخزن، أو أعد ضبط المخزن. راجع قسم «بُعد التضمين» في [وثيقة التصميم](/edge/ar/learn/aerospike-memory-design).
+
+**ظهور `ImportError` يطلب تثبيت العميل.** الإضافة غير مثبتة في البيئة التي تشغّل شيفرتك. ثبّتها بالأمر `pip install "crewai[aerospike]"`.
+
+**ظهور `ValueError` يذكر مواصفة التخزين.** يجب أن تكون المواصفة `aerospike://host:port/namespace`، ويمكن أن يليها `?set_prefix=NAME`. تُرفض بيانات الاعتماد في المواصفة وأي مفتاح استعلام آخر.
+
+## الخطوات التالية
+
+اقرأ [تصميم ذاكرة Aerospike](/edge/ar/learn/aerospike-memory-design) لمعرفة نموذج البيانات والفهارس وكلفة البحث والحدود ومتطلبات العميل. ولمعرفة كيف تعمل الذاكرة بوجه عام، راجع [الذاكرة](/ar/concepts/memory).

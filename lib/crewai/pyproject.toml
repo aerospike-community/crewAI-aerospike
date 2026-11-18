@@ -124,6 +124,11 @@ file-processing = [
 qdrant-edge = [
     "qdrant-edge-py>=0.6.0",
 ]
+# The Aerospike SDK needs Python 3.11 or newer and is deliberately not version-pinned because no pin has been verified.
+aerospike = [
+    "aerospike-sdk; python_version >= '3.11'",
+    "numpy",
+]
 
 
 [tool.uv]

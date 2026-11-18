@@ -41,10 +41,13 @@ exist, apply the same semantic change — do not rewrite unrelated sections.
 Rules:
 
 - Translate prose and frontmatter values (`title`, `description`, `sidebarTitle`)
-- Keep MDX/JSX tags, code blocks, URLs, and identifiers unchanged
+- Keep MDX/JSX tags, code blocks, and identifiers unchanged; keep external URLs
+  unchanged
 - Keep terms like Agent, Crew, Task, Flow, LLM, API, CLI, MCP in English where
   appropriate
-- Rewrite internal links: `/en/` → `/{lang}/` (`/ar/`, `/ko/`, `/pt-BR/`)
+- Rewrite internal links: `/en/` → `/{lang}/` (`/ar/`, `/ko/`, `/pt-BR/`),
+  and `/edge/en/` → `/edge/{lang}/` to keep links to Edge-only pages in the
+  Edge version.
 - Do not add translator notes
 
 ## Step 4 — Verify (optional)
@@ -62,7 +65,8 @@ Commit English and locale files together.
 - [ ] ar: updated/created matching files
 - [ ] ko: updated/created matching files
 - [ ] pt-BR: updated/created matching files
-- [ ] Links use /{lang}/ prefix; code blocks unchanged
+- [ ] Links use the matching locale prefix; Edge-only links retain `/edge/`
+- [ ] Code blocks unchanged
 - [ ] docs/docs.json updated if new English page added
 ```
 
